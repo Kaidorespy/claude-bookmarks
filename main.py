@@ -1,9 +1,8 @@
 """Claude Bookmarks - Save and resume Claude Code sessions."""
 
-import os
 import sys
 import json
-import subprocess
+import re
 from datetime import datetime
 from pathlib import Path
 from typing import Optional
@@ -16,6 +15,7 @@ HISTORY_FILE = CLAUDE_DIR / "history.jsonl"
 BOOKMARKS_FILE = Path.home() / ".claude-bookmarks" / "bookmarks.json"
 HIDDEN_FILE = Path.home() / ".claude-bookmarks" / "hidden_sessions.json"
 SETTINGS_FILE = Path.home() / ".claude-bookmarks" / "settings.json"
+SESSION_CACHE_FILE = Path.home() / ".claude-bookmarks" / "session_cache.json"
 BOOKMARKS_FILE.parent.mkdir(parents=True, exist_ok=True)
 
 # Default settings
@@ -69,9 +69,9 @@ COLORS = {
 
 # Default flags for resume command
 DEFAULT_FLAGS = {
-    "dangerously_skip_permissions": True,
-    "permission_mode": "bypassPermissions",
-    "model": "claude-opus-4-5-20251101",
+    "dangerously_skip_permissions": False,
+    "permission_mode": None,
+    "model": None,
 }
 
 # Flag descriptions for tooltips
@@ -91,9 +91,14 @@ class Tooltip:
         self.tooltip_window = None
         widget.bind("<Enter>", self._show)
         widget.bind("<Leave>", self._hide)
+        # Without this, switching views while hovering leaves the tooltip
+        # floating on screen forever (overrideredirect windows have no close button)
+        widget.bind("<Destroy>", self._hide)
 
     def _show(self, event=None):
         if self.tooltip_window:
+            return
+        if not self.widget.winfo_exists():
             return
         x = self.widget.winfo_rootx() + 20
         y = self.widget.winfo_rooty() + self.widget.winfo_height() + 5
@@ -117,7 +122,10 @@ class Tooltip:
 
     def _hide(self, event=None):
         if self.tooltip_window:
-            self.tooltip_window.destroy()
+            try:
+                self.tooltip_window.destroy()
+            except Exception:
+                pass
             self.tooltip_window = None
 
 
@@ -172,8 +180,6 @@ def save_hidden(hidden: set[str]):
 
 def clean_message_content(content) -> str:
     """Clean internal markers from message content for display."""
-    import re
-
     # Recursively extract text from complex structures
     def extract_text(obj) -> str:
         if obj is None:
@@ -203,6 +209,31 @@ def clean_message_content(content) -> str:
     return content
 
 
+def decode_project_dir_name(name: str) -> str:
+    """Lossy fallback for sessions with no cwd field: the encoding replaced both
+    path separators and real hyphens with '-', so hyphenated folder names mangle."""
+    m = re.match(r"^([A-Za-z])--(.*)$", name)
+    if m:
+        return f"{m.group(1)}:\\" + m.group(2).replace("-", "\\")
+    return name.replace("-", "/")
+
+
+def _load_session_cache() -> dict:
+    if SESSION_CACHE_FILE.exists():
+        try:
+            return json.loads(SESSION_CACHE_FILE.read_text(encoding="utf-8"))
+        except (json.JSONDecodeError, OSError):
+            return {}
+    return {}
+
+
+def _save_session_cache(cache: dict):
+    try:
+        SESSION_CACHE_FILE.write_text(json.dumps(cache), encoding="utf-8")
+    except OSError:
+        pass
+
+
 def get_all_sessions() -> list[dict]:
     """Scan all sessions from .claude directory."""
     sessions = []
@@ -210,19 +241,17 @@ def get_all_sessions() -> list[dict]:
     if not PROJECTS_DIR.exists():
         return sessions
 
+    cache = _load_session_cache()
+    fresh_cache = {}
+
     for project_dir in PROJECTS_DIR.iterdir():
         if not project_dir.is_dir():
             continue
 
-        project_name = project_dir.name.replace("C--", "C:\\").replace("-", "\\")
+        fallback_name = decode_project_dir_name(project_dir.name)
 
         for session_file in project_dir.glob("*.jsonl"):
             session_id = session_file.stem
-
-            # Skip if it's a folder (has accompanying directory)
-            if (project_dir / session_id).is_dir():
-                # This might be a session with subagents, still include the main file
-                pass
 
             # Get basic info from file
             try:
@@ -230,32 +259,34 @@ def get_all_sessions() -> list[dict]:
                 modified = datetime.fromtimestamp(stat.st_mtime)
                 size = stat.st_size
 
-                # Skip empty files
-                if size == 0:
-                    continue
-
                 # Skip files smaller than ~100 bytes (basically empty sessions)
                 if size < 100:
+                    continue
+
+                # Reuse cached parse if the file hasn't changed
+                cache_key = str(session_file)
+                cached = cache.get(cache_key)
+                if cached and cached.get("mtime") == stat.st_mtime and cached.get("size") == size:
+                    entry = dict(cached["session"])
+                    entry["modified"] = datetime.fromtimestamp(entry["modified"])
+                    sessions.append(entry)
+                    fresh_cache[cache_key] = cached
                     continue
 
                 # Try to get first and last messages
                 first_msg = None
                 last_msg = None
                 model = None
+                cwd = None
                 message_count = 0
-                first_message_from_user = True  # Assume user starts unless proven otherwise
 
                 with open(session_file, "r", encoding="utf-8") as f:
-                    first_entry_checked = False
                     for line in f:
                         try:
                             data = json.loads(line)
 
-                            # Check who sent the very first message
-                            if not first_entry_checked:
-                                first_entry_checked = True
-                                if data.get("type") != "user":
-                                    first_message_from_user = False
+                            if cwd is None and data.get("cwd"):
+                                cwd = data.get("cwd")
 
                             if data.get("type") == "user":
                                 message_count += 1
@@ -268,6 +299,10 @@ def get_all_sessions() -> list[dict]:
                                     model = msg.get("model")
                         except json.JSONDecodeError:
                             continue
+
+                # Real project path from the session itself; the encoded folder
+                # name is a lossy fallback
+                project_name = cwd or fallback_name
 
                 # Detect if this looks like a subagent/daemon session
                 is_subagent = False
@@ -322,13 +357,14 @@ def get_all_sessions() -> list[dict]:
                 except OSError:
                     pass
 
-                sessions.append({
+                entry = {
                     "session_id": session_id,
                     "project": project_name,
                     "project_dir": str(project_dir),
                     "file_path": str(session_file),
                     "modified": modified,
                     "size": size,
+                    "cwd": cwd,
                     "first_message": clean_message_content(first_msg)[:200] if first_msg else "",
                     "last_message": clean_message_content(last_msg)[:200] if last_msg else "",
                     "model": model,
@@ -336,9 +372,21 @@ def get_all_sessions() -> list[dict]:
                     "is_subagent": is_subagent,
                     "hit_context_limit": hit_context_limit,
                     "context_collapsed": context_collapsed,
-                })
-            except Exception as e:
+                }
+                sessions.append(entry)
+
+                cache_entry = dict(entry)
+                cache_entry["modified"] = stat.st_mtime
+                fresh_cache[cache_key] = {
+                    "mtime": stat.st_mtime,
+                    "size": size,
+                    "session": cache_entry,
+                }
+            except Exception:
                 continue
+
+    # Prunes entries for deleted files as a side effect
+    _save_session_cache(fresh_cache)
 
     # Sort by modified date, newest first
     sessions.sort(key=lambda x: x["modified"], reverse=True)
@@ -385,7 +433,36 @@ def get_session_messages(session_file: str, limit: int = 10) -> list[dict]:
     return messages[-limit:]  # Last N messages
 
 
-def build_resume_command(session_id: str, flags: dict) -> str:
+def find_session_file(session_id: str) -> Optional[str]:
+    """Locate the JSONL file for a session ID."""
+    if not PROJECTS_DIR.exists():
+        return None
+    for project_dir in PROJECTS_DIR.iterdir():
+        potential = project_dir / f"{session_id}.jsonl"
+        if potential.exists():
+            return str(potential)
+    return None
+
+
+def get_session_cwd(session_file: str) -> Optional[str]:
+    """Read the session's working directory from its first few entries."""
+    try:
+        with open(session_file, "r", encoding="utf-8") as f:
+            for i, line in enumerate(f):
+                if i > 20:
+                    break
+                try:
+                    data = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                if data.get("cwd"):
+                    return data["cwd"]
+    except OSError:
+        pass
+    return None
+
+
+def build_resume_command(session_id: str, flags: dict, project_path: Optional[str] = None) -> str:
     """Build the claude resume command with flags."""
     cmd = "claude"
 
@@ -399,6 +476,11 @@ def build_resume_command(session_id: str, flags: dict) -> str:
         cmd += f" --model {flags['model']}"
 
     cmd += f" --resume {session_id}"
+
+    if project_path:
+        # --resume only finds the session when run from its project directory.
+        # ';' chains in PowerShell/bash/zsh (not cmd.exe, where it half-works)
+        cmd = f'cd "{project_path}" ; {cmd}'
 
     return cmd
 
@@ -683,7 +765,9 @@ class BookmarksApp(ctk.CTk):
         btn_frame.pack(fill="x", pady=(10, 0))
 
         def copy_cmd():
-            cmd = build_resume_command(bookmark["session_id"], self.flags)
+            session_file = find_session_file(bookmark["session_id"])
+            cwd = get_session_cwd(session_file) if session_file else None
+            cmd = build_resume_command(bookmark["session_id"], self.flags, cwd)
             self.clipboard_clear()
             self.clipboard_append(cmd)
             copy_btn.configure(text="Copied!")
@@ -1026,6 +1110,9 @@ class BookmarksApp(ctk.CTk):
 
     def _do_search(self):
         """Actually perform the search."""
+        # The debounce timer can fire after a view switch destroyed the entry
+        if not (hasattr(self, 'search_entry') and self.search_entry.winfo_exists()):
+            return
         self.search_text = self.search_entry.get().strip()
         self._apply_filter()
 
@@ -1108,7 +1195,7 @@ class BookmarksApp(ctk.CTk):
 
     def _do_bookmark_search(self):
         """Actually perform the bookmark search."""
-        if hasattr(self, 'bookmark_search_entry'):
+        if hasattr(self, 'bookmark_search_entry') and self.bookmark_search_entry.winfo_exists():
             self.bookmark_search_text = self.bookmark_search_entry.get().strip().lower()
             self._refresh_bookmark_list()
 
@@ -1120,7 +1207,7 @@ class BookmarksApp(ctk.CTk):
     def _refresh_bookmark_list(self):
         """Refresh just the bookmark list (for search)."""
         # Find and clear the scroll frame
-        if hasattr(self, '_bookmark_scroll'):
+        if hasattr(self, '_bookmark_scroll') and self._bookmark_scroll.winfo_exists():
             for w in self._bookmark_scroll.winfo_children():
                 w.destroy()
             sorted_bookmarks = self._get_sorted_bookmarks()
@@ -1467,7 +1554,15 @@ class BookmarksApp(ctk.CTk):
             "created": datetime.now().strftime("%Y-%m-%d %H:%M"),
         }
 
-        self.bookmarks.insert(0, bookmark)
+        # Re-bookmarking a session updates it in place instead of duplicating
+        # (delete removes every bookmark with a matching session_id)
+        for i, b in enumerate(self.bookmarks):
+            if b["session_id"] == session_id:
+                bookmark["created"] = b.get("created", bookmark["created"])
+                self.bookmarks[i] = bookmark
+                break
+        else:
+            self.bookmarks.insert(0, bookmark)
         save_bookmarks(self.bookmarks)
         self._show_bookmarks()
 
@@ -1661,12 +1756,12 @@ class BookmarksApp(ctk.CTk):
         # Find session file
         file_path = item.get("file_path")
         if not file_path:
-            # Search for it
-            for project_dir in PROJECTS_DIR.iterdir():
-                potential = project_dir / f"{session_id}.jsonl"
-                if potential.exists():
-                    file_path = str(potential)
-                    break
+            file_path = find_session_file(session_id)
+
+        # Real project directory, needed for the resume command
+        session_cwd = item.get("cwd")
+        if not session_cwd and file_path:
+            session_cwd = get_session_cwd(file_path)
 
         if file_path and Path(file_path).exists():
             # For subagents, show full transcript; for conversations, show last 10
@@ -1803,19 +1898,19 @@ class BookmarksApp(ctk.CTk):
             ).pack(anchor="w", pady=(0, 5))
 
             # Toggle variables
-            skip_perms_var = ctk.BooleanVar(value=self.flags.get("dangerously_skip_permissions", True))
+            skip_perms_var = ctk.BooleanVar(value=self.flags.get("dangerously_skip_permissions", False))
             bypass_var = ctk.BooleanVar(value=bool(self.flags.get("permission_mode")))
 
-            # Model options
+            # Model options - aliases resolve to the latest version, so this
+            # list doesn't go stale with every model release
             model_options = {
                 "None (use default)": None,
-                "Opus 4.5": "claude-opus-4-5-20251101",
-                "Opus 4.6": "claude-opus-4-6",
-                "Sonnet 4.5": "claude-sonnet-4-5-20250929",
-                "Haiku 4.5": "claude-haiku-4-5-20251001",
+                "Opus (latest)": "opus",
+                "Sonnet (latest)": "sonnet",
+                "Haiku (latest)": "haiku",
             }
-            current_model = self.flags.get("model", "claude-opus-4-5-20251101")
-            current_model_display = next((k for k, v in model_options.items() if v == current_model), "Opus 4.5")
+            current_model = self.flags.get("model")
+            current_model_display = next((k for k, v in model_options.items() if v == current_model), "None (use default)")
 
             def update_command(*args):
                 # Update flags based on toggles
@@ -1823,7 +1918,7 @@ class BookmarksApp(ctk.CTk):
                 self.flags["permission_mode"] = "bypassPermissions" if bypass_var.get() else None
                 self.flags["model"] = model_options.get(model_menu.get())
                 # Update command display
-                cmd = build_resume_command(session_id, self.flags)
+                cmd = build_resume_command(session_id, self.flags, session_cwd)
                 cmd_label.configure(text=cmd)
 
             ctk.CTkCheckBox(
@@ -1877,7 +1972,7 @@ class BookmarksApp(ctk.CTk):
             update_command()
 
             def copy_cmd():
-                cmd = build_resume_command(session_id, self.flags)
+                cmd = build_resume_command(session_id, self.flags, session_cwd)
                 self.clipboard_clear()
                 self.clipboard_append(cmd)
                 copy_btn.configure(text="Copied!")

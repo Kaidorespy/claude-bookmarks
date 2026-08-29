@@ -36,7 +36,8 @@ Built because scrolling through `~/.claude/projects/` looking for "that one conv
 
 **Resume Command Builder**
 - Toggleable flags (--dangerously-skip-permissions, --permission-mode, --model)
-- Model selector (Opus 4.5, Opus 4.6, Sonnet 4.5, Haiku 4.5)
+- Model selector (Opus / Sonnet / Haiku - aliases, always the latest version)
+- Includes a `cd` to the session's project directory, so the command works from anywhere
 - One-click copy to clipboard
 
 **Customization**
@@ -94,6 +95,7 @@ The app stores data in `~/.claude-bookmarks/`:
 - `bookmarks.json` - Your saved bookmarks
 - `settings.json` - Theme and preferences
 - `hidden_sessions.json` - Sessions you've hidden
+- `session_cache.json` - Parsed session metadata (safe to delete, rebuilds on next scan)
 
 ## Subagent Detection
 
